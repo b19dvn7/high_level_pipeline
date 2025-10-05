@@ -1,0 +1,7 @@
+[debug] states ok/bad=120/0 gate ok/bad=200/0 n=80
+[debug] sample acts=[0.0, 0.0, 0.0, 0.0, 0.0] rets=[-0.000129, -0.000129, -0.000129, -0.000104, -3.7e-05]
+[backtest H]
+ rows=80  trades=2  trade_winrate=0.00%  per_bar_hitrate=37.50%
+ H=40 hold_bars=4 mode=sign th=0.15 scale=None
+ equity_end=0.9975 Sharpe_like=-0.27 MaxDD=0.26% CAGR_like=-0.25%
+ exposure=10.00% avg_turnover=0.0500/bar avg_trade_pnl=-0.000775 median_trade_pnl=-0.000775

@@ -1,0 +1,1 @@
+mode,H,fee_bps,min_agree_k,agree_eps,min_mag,action_thresh,linear_scale,hold_bars,rows,trades,trade_winrate,per_bar_hitrate,equity_end,Sharpe_like,MaxDD,CAGR_like,exposure,avg_turnover,avg_trade_pnl,median_trade_pnl,saturation_neg1,saturation_pos1,saturation_mid,gate_csv,tag

@@ -1,0 +1,38 @@
+                ┌─────────────────────────────────────────────────────────┐
+                │                 Parquet Snapshots (L2/L1)               │
+                │   snaps_fixed/*.parquet  (ts,bid_px,bid_sz,ask_px,ask_sz)│
+                └───────────────┬─────────────────────────────────────────┘
+                                │  (SQL with predicate + projection pushdown)
+                                ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ DuckDB (in-process OLAP)                                                   │
+│  • WHERE pair/time filters → prunes row groups (I/O ↓)                     │
+│  • SELECT only needed feature cols (projection pushdown)                   │
+│  • Window funcs (LAG/LEAD) to label & build s, s′, r inside SQL            │
+│  • Chunked fetch (fetch_df_chunk) → constant RAM                           │
+└───────────────┬────────────────────────────────────────────────────────────┘
+                │  batches (DataFrames / Arrow)
+                ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ Replay Buffer (off-policy)                                                 │
+│  • Append transitions: (s, a, r, s′, done)                                 │
+│  • Optional: derive a from labels or keep action=None for pure policy RL   │
+│  • Balanced sampling, n-step, PER (optional)                               │
+└───────────────┬────────────────────────────────────────────────────────────┘
+                │  sampled mini-batches (PyTorch tensors)
+                ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│ TD3 / SAC Trainer                                                          │
+│  • Twin critics (both)                                                     │
+│  • TD3: target policy smoothing + delayed actor updates                    │
+│  • SAC: entropy-regularized objective with α (fixed or auto)               │
+│  • Shared: target networks, Polyak τ                                       │
+└───────────────┬────────────────────────────────────────────────────────────┘
+                │  updated weights, metrics (F1/Sharpe/custom)
+                ▼
+        ┌────────────────────────────────────────────────┐
+        │ Live/Backtest Loop (your bot/GUI)              │
+        │  • Evaluate, log signals, check 10m/30m/1h     │
+        │  • Save state to live_state.json for GUI       │
+        └────────────────────────────────────────────────┘
+

@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+import argparse, csv, itertools, os, re, subprocess, sys, time, json, shutil
+from datetime import datetime
+from pathlib import Path
+
+# required files in CWD
+GATE_JSON   = "consensus_gate_td3bc.json"
+SCALER_JSON = "scaler.json"
+LIVE_GATE   = "consensus_gate_live_plus.py"
+BACKTEST    = "backtest_gate_horizon_v3.py"
+
+RESULTS_HEADER = [
+    "mode","H","fee_bps","min_agree_k","agree_eps","min_mag",
+    "action_thresh","linear_scale","hold_bars",
+    "rows","trades","trade_winrate","per_bar_hitrate",
+    "equity_end","Sharpe_like","MaxDD","CAGR_like",
+    "exposure","avg_turnover","avg_trade_pnl","median_trade_pnl",
+    "saturation_neg1","saturation_pos1","saturation_mid",
+    "gate_csv","score","trial","total"
+]
+
+BT_RX = {
+    "rows":               re.compile(r"\brows=(\d+)"),
+    "trades":             re.compile(r"\btrades=(\d+)"),
+    "trade_winrate":      re.compile(r"\btrade_winrate=([0-9.]+)%"),
+    "per_bar_hitrate":    re.compile(r"\bper_bar_hitrate=([0-9.]+)%"),
+    "equity_end":         re.compile(r"\bequity_end=([0-9.]+)"),
+    "Sharpe_like":        re.compile(r"\bSharpe_like=([\-0-9.]+)"),
+    "MaxDD":              re.compile(r"\bMaxDD=([0-9.]+)%"),
+    "CAGR_like":          re.compile(r"\bCAGR_like=([\-0-9.]+)%"),
+    "exposure":           re.compile(r"\bexposure=([0-9.]+)%"),
+    "avg_turnover":       re.compile(r"\bavg_turnover=([0-9.]+)\/bar"),
+    "avg_trade_pnl":      re.compile(r"\bavg_trade_pnl=([\-0-9.eE]+)"),
+    "median_trade_pnl":   re.compile(r"\bmedian_trade_pnl=([\-0-9.eE]+)")
+}
+
+def must_exist(path: str):
+    if not Path(path).exists():
+        sys.exit(f"[error] required file not found: {path}")
+
+def read_states(states_csv: str):
+    with open(states_csv, newline="") as f:
+        rdr = csv.reader(f)
+        header = next(rdr, None)
+        rows = [r for r in rdr]
+    if not rows:
+        sys.exit("[error] states.csv has no rows")
+    return header, rows
+
+def run_live_gate_on_row(state_row: str, device: str, mode: str,
+                         min_agree_k: int, agree_eps: float, min_mag: float) -> str:
+    cmd = [
+        sys.executable, LIVE_GATE,
+        "--gate", GATE_JSON,
+        "--scaler", SCALER_JSON,
+        "--state_row", state_row,
+        "--device", device,
+        "--consensus-mode", mode,
+        "--min-agree-k", str(min_agree_k),
+        "--agree-eps", f"{agree_eps}",
+        "--min-mag", f"{min_mag}",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"[live_gate] rc={res.returncode}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+    candidate = None
+    for line in res.stdout.strip().splitlines():
+        t = line.strip()
+        if t.startswith("row_idx,") or (t and t[0].isdigit() and "," in t):
+            candidate = t
+    if not candidate:
+        raise RuntimeError(f"[live_gate] could not parse output:\n{res.stdout}")
+    return candidate
+
+def build_gate_from_states(states_csv: str, out_csv: str, device: str, mode: str,
+                           min_agree_k: int, agree_eps: float, min_mag: float,
+                           progress_every: int = 25) -> dict:
+    _, rows = read_states(states_csv)
+    lines = ["row_idx,agree,action,max_pair_diff,min_q"]
+    neg1 = pos1 = mid = 0
+    n = len(rows)
+    print(f"[gate] building {out_csv} rows={n} k={min_agree_k} eps={agree_eps} mag={min_mag}")
+    last_flush = time.time()
+    for i, r in enumerate(rows):
+        state_row = ",".join(r)
+        line = run_live_gate_on_row(state_row, device, mode, min_agree_k, agree_eps, min_mag)
+        if line.startswith("row_idx,"):  # skip header from tool
+            continue
+        if line.startswith("0,"):
+            line = f"{i}" + line[1:]
+        lines.append(line)
+        try:
+            a = float(line.split(",")[2])
+            if a <= -0.99: neg1 += 1
+            elif a >= 0.99: pos1 += 1
+            else: mid += 1
+        except Exception:
+            pass
+        if (i+1) % progress_every == 0:
+            pct = (i+1)*100.0/n
+            print(f"[gate] {i+1}/{n} ({pct:5.1f}%)  neg≈-1:{neg1} pos≈+1:{pos1} mid:{mid}")
+        else:
+            now = time.time()
+            if now - last_flush >= 0.75:
+                print(".", end="", flush=True)
+                last_flush = now
+    Path(out_csv).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print()
+    return {"neg1": neg1, "pos1": pos1, "mid": mid, "n": n}
+
+def _parse_bt_metrics(text: str) -> dict:
+    def _find(rx): m = rx.search(text); return m and m.group(1)
+    out = {
+        "rows":             int(_find(BT_RX["rows"]) or 0),
+        "trades":           int(_find(BT_RX["trades"]) or 0),
+        "trade_winrate":    float(_find(BT_RX["trade_winrate"]) or 0.0),
+        "per_bar_hitrate":  float(_find(BT_RX["per_bar_hitrate"]) or 0.0),
+        "equity_end":       float(_find(BT_RX["equity_end"]) or 0.0),
+        "Sharpe_like":      float(_find(BT_RX["Sharpe_like"]) or 0.0),
+        "MaxDD":            float(_find(BT_RX["MaxDD"]) or 0.0),
+        "CAGR_like":        float(_find(BT_RX["CAGR_like"]) or 0.0),
+        "exposure":         float(_find(BT_RX["exposure"]) or 0.0),
+        "avg_turnover":     float(_find(BT_RX["avg_turnover"]) or 0.0),
+        "avg_trade_pnl":    float(_find(BT_RX["avg_trade_pnl"]) or 0.0),
+        "median_trade_pnl": float(_find(BT_RX["median_trade_pnl"]) or 0.0),
+    }
+    return out
+
+def run_bt(mode, states_csv, gate_csv, H, fee_bps, hold_bars, action_thresh, linear_scale, stream, log_path):
+    cmd = [sys.executable, BACKTEST,
+           "--states", states_csv, "--gate", gate_csv, "--h", str(H), "--fee_bps", str(fee_bps)]
+    if mode == "sign":
+        cmd += ["--mode","sign","--hold_bars",str(hold_bars),"--action_thresh",f"{action_thresh}","--verbose"]
+    else:
+        cmd += ["--mode","linear","--hold_bars",str(hold_bars),"--linear_scale",f"{linear_scale}","--verbose"]
+    if stream:
+        print(f"[bt] {' '.join(cmd)}")
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        captured = []
+        with open(log_path, "w", encoding="utf-8") as logf:
+            for line in p.stdout:
+                captured.append(line); logf.write(line); print(line.rstrip())
+        rc = p.wait()
+        if rc != 0: raise RuntimeError(f"[backtest] rc={rc}\n{''.join(captured)}")
+        return _parse_bt_metrics("".join(captured))
+    else:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        Path(log_path).write_text(res.stdout + "\n" + res.stderr, encoding="utf-8")
+        if res.returncode != 0:
+            raise RuntimeError(f"[backtest] rc={res.returncode}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+        return _parse_bt_metrics(res.stdout + "\n" + res.stderr)
+
+def score_result(m: dict) -> float:
+    if m["trades"] == 0: return -1e9
+    s = 0.0
+    s += (m["equity_end"] - 1.0) * 100.0
+    s += 0.5 * m["Sharpe_like"]
+    s -= 0.1 * m["MaxDD"]
+    if m["exposure"] > 95.0: s -= 1.0
+    return s
+
+def term_width():
+    try:
+        return shutil.get_terminal_size((120, 20)).columns
+    except Exception:
+        return 120
+
+def oneline_status(trial, total, mode, k, eps, mag, th, ls, hold, gate_name, extra=""):
+    w = term_width()
+    parts = [
+        f"[{trial}/{total}]",
+        f"mode={mode}",
+        f"k={k}",
+        f"eps={eps:g}",
+        f"mag={mag:g}",
+        (f"th={th:g}" if th is not None else f"ls={ls:g}"),
+        f"hold={hold}",
+        f"gate={gate_name}",
+        extra
+    ]
+    s = " ".join(p for p in parts if p)
+    if len(s) > w-2: s = s[:w-5] + "..."
+    print("\r" + s, end="", flush=True)
+
+def write_live_files(prefix: Path, record: dict):
+    # append JSONL
+    with open(prefix.with_suffix(".now.jsonl"), "a", encoding="utf-8") as jf:
+        jf.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # latest-only CSV (overwrite)
+    fields = list(record.keys())
+    csv_path = prefix.with_suffix(".now.csv")
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="") as cf:
+            csv.writer(cf).writerow(fields)
+    with open(csv_path, "w", newline="") as cf:
+        w = csv.DictWriter(cf, fieldnames=fields); w.writeheader(); w.writerow(record)
+
+def main():
+    for f in (GATE_JSON, SCALER_JSON, LIVE_GATE, BACKTEST):
+        must_exist(f)
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--states", required=True)
+    ap.add_argument("--device", choices=["cpu","cuda","mps"], default="cpu")
+    ap.add_argument("--mode", choices=["sign","linear"], required=True)
+    ap.add_argument("--H", type=int, required=True)
+    ap.add_argument("--fee-bps", type=float, required=True)
+
+    ap.add_argument("--min-agree-k", type=int, nargs="+", default=[2,3])
+    ap.add_argument("--agree-eps", type=float, nargs="+", default=[0.05,0.10,0.15])
+    ap.add_argument("--min-mag", type=float, nargs="+", default=[0.10,0.20])
+
+    ap.add_argument("--action-th", type=float, nargs="+", default=[0.10])       # sign
+    ap.add_argument("--linear-scale", type=float, nargs="+", default=[0.5,1.0]) # linear
+    ap.add_argument("--hold-bars", type=int, nargs="+", default=[8,12])
+
+    ap.add_argument("--outdir", default=None)
+    ap.add_argument("--max-trials", type=int, default=None)
+
+    ap.add_argument("--stream", action="store_true", help="stream backtest output live (tee to log)")
+    ap.add_argument("--progress-every", type=int, default=25, help="print gate-build progress every N rows")
+
+    # NEW: controlled noise for params
+    ap.add_argument("--print-every", type=int, default=10, help="print a full summary line every N trials")
+    ap.add_argument("--live-files-prefix", default="runs/live", help="prefix for live .now.jsonl/.now.csv outputs")
+    args = ap.parse_args()
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    outdir = Path(args.outdir or f"runs/sweep_{args.mode}_{ts}").resolve()
+    (outdir / "gates").mkdir(parents=True, exist_ok=True)
+    results_csv = outdir / "results.csv"
+    live_prefix = Path(args.live_files_prefix)
+
+    _, rows = read_states(args.states)
+    print(f"[info] states rows={len(rows)} mode={args.mode} H={args.H} fee_bps={args.fee_bps}")
+    print(f"[info] writing to {outdir}")
+
+    # grid + total count for nicer status
+    if args.mode == "sign":
+        combos = list(itertools.product(args.min_agree_k, args.agree_eps, args.min_mag,
+                                        args.action_th, args.hold_bars))
+    else:
+# === Recommended Params (no live execution) ===
+# We re-read results.csv we just wrote into out_dir and pick a "best" row to print clean commands.
+
+import csv, os
+
+def _num(x, default=0.0):
+    try:
+        return float(x)
+    except: 
+        return default
+
+def _pick_best(results_csv):
+    if not os.path.exists(results_csv):
+        return None
+    with open(results_csv, newline='') as f:
+        rdr = csv.DictReader(f)
+        rows = list(rdr)
+    if not rows:
+        return None
+    # Prefer higher equity_end, then higher Sharpe_like
+    rows.sort(key=lambda r: (_num(r.get('equity_end',0)), _num(r.get('Sharpe_like',0))), reverse=True)
+    return rows[0]
+
+try:
+    results_csv = os.path.join(out_dir, "results.csv")  # out_dir is defined earlier in the script
+    best = _pick_best(results_csv)
+    if best is None:
+        print("[warn] no best row to print (results.csv empty?).")
+    else:
+        gate_csv = best.get('gate_csv','')
+        tag      = best.get('tag','')
+        win      = best.get('trade_winrate','')
+        hit      = best.get('per_bar_hitrate','')
+        eq       = best.get('equity_end','')
+        sh       = best.get('Sharpe_like','')
+        dd       = best.get('MaxDD','')
+        hold     = best.get('hold_bars','')
+        th       = best.get('action_thresh','')
+        ls       = best.get('linear_scale','')
+        mode     = args.mode
+
+        print("\\n=== Recommended Params (no live execution) ===")
+        print(f"Gate CSV: {gate_csv}")
+        print(f"Tag     : {tag}")
+        print(f"KPI     : Win {win} | Hit {hit} | Eq {eq} | Sharpe {sh} | MaxDD {dd}")
+
+        print("\\n# When you want to backtest this exact gate again:")
+        print("python3 backtest_gate_horizon_v3.py \\")
+        print(f"  --states {args.states} --gate {os.path.join(out_dir,'gates',gate_csv)} \\")
+        if th:
+            print(f"  --h {args.H} --mode {mode} --action_thresh {th} --hold_bars {hold} --fee_bps {args.fee_bps}")
+        else:
+            # linear mode case
+            print(f"  --h {args.H} --mode {mode} --linear_scale {ls} --hold_bars {hold} --fee_bps {args.fee_bps}")
+
+except Exception as e:
+    print(f"[warn] footer print failed: {e}")

@@ -1,0 +1,2 @@
+mode,H,fee_bps,min_agree_k,agree_eps,min_mag,action_thresh,linear_scale,hold_bars,rows,trades,equity_end,Sharpe_like,MaxDD,exposure,gate_tag
+sign,40,,,,,,,8,160,8,1.0124,0.15,1.03%,48.12%,

@@ -1,0 +1,12 @@
+{
+  "type": "td3bc_consensus_gate",
+  "actors": [
+    "td3bc_actor_seed42.pt",
+    "td3bc_actor_seed43.pt",
+    "td3bc_actor_seed44.pt"
+  ],
+  "agree_eps": 0.15,
+  "q_min_thresh": -1000000000.0,
+  "state_dim": 6,
+  "act_limit": 1.0
+}
